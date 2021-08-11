@@ -42,6 +42,12 @@ pfam_test = 'data/pfam/Pfam-A.test.fasta'
 
 
 def preprocess_sequence(s, alphabet):
+    """
+    Convert alphabet sequence to integer sequence.
+    :param s: sequence in byte format
+    :param alphabet: a function to convert alphabet to integers
+    :return: padded converted sequence
+    """
     x = alphabet.encode(s)
     # pad with start/stop token
     z = np.zeros(len(x)+2, dtype=x.dtype)
@@ -49,6 +55,14 @@ def preprocess_sequence(s, alphabet):
     return z
 
 def load_pfam(path, alph):
+    """
+    Load pfam data set, converting 1-codon a.a. into integers,
+    pad 0 on each side of sequence, save the group of each sequence
+    and the sequence.
+    :param path: pfame data file path
+    :param alph: alphabet conversion function
+    :return: groups they belong to, sequence info in integer
+    """
     # load path sequences and families
     with open(path, 'rb') as f:
         group = []
@@ -56,18 +70,46 @@ def load_pfam(path, alph):
         for name,sequence in fasta.parse_stream(f):
             x = preprocess_sequence(sequence.upper(), alph)
             sequences.append(x)
+            # name eg: b'G1LZL4_AILME/173-208 G1LZL4.1 PF10417.8;1-cysPrx_C;'
+            # get the last entry of the name, 10-char
             family = name.split(b';')[-2]
+            # family eg: b'1-cysPrx_C', dtype='|S10', 10-char string;
             group.append(family)
+
+    # convert to np.array for convenience
     group = np.array(group)
     sequences = np.array(sequences)
     return group, sequences
 
 
 def main():
+    """
+    Main function for training the language model on pfam data set.
+    :return:
+    """
     args = parser.parse_args()
 
-    alph = Uniprot21()
-    ntokens = len(alph)
+    alph        = Uniprot21()
+    ntokens     = len(alph)     # ntokens=21, 21th represents any unnatural amino acid;
+    nin         = ntokens + 1
+    nout        = ntokens
+    embedding_dim = 21
+    mask_idx    = ntokens
+
+    hidden_dim  = args.hidden_dim
+    num_layers  = args.num_layers
+    device      = args.device
+    num_epochs  = args.num_epochs
+    clip        = args.clip
+    save_prefix = args.save_prefix
+    dropout     = args.dropout
+    lr          = args.lr
+    l2          = args.l2
+    mb          = args.minibatch_size
+    tied        = not args.untied
+    output      = sys.stdout
+    if args.output is not None:
+        output  = open(args.output, 'w')
 
     ## load the training sequences
     train_group, X_train = load_pfam(pfam_train, alph)
@@ -77,33 +119,19 @@ def main():
     test_group, X_test = load_pfam(pfam_test, alph)
     print('# loaded', len(X_test), 'sequences from', pfam_test, file=sys.stderr)
 
-    ## initialize the model
-    nin = ntokens + 1
-    nout = ntokens
-    embedding_dim = 21
-    hidden_dim = args.hidden_dim
-    num_layers = args.num_layers
-    mask_idx = ntokens
-    dropout = args.dropout
-
-    tied = not args.untied
-
+    # Initialize the model
     model = src.models.sequence.BiLM(nin, nout, embedding_dim, hidden_dim, num_layers
                                     , mask_idx=mask_idx, dropout=dropout, tied=tied)
     print('# initialized model', file=sys.stderr)
 
-    device = args.device
+    # Device
     use_cuda = torch.cuda.is_available() and (device == -2 or device >= 0)
     if device >= 0:
         torch.cuda.set_device(device)
     if use_cuda:
         model = model.cuda()
 
-    ## form the data iterators and optimizer
-    lr = args.lr
-    l2 = args.l2
-    solver = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=l2)
-
+    ## Iterators and optimizer
     def collate(xs):
         B = len(xs)
         N = max(len(x) for x in xs)
@@ -119,54 +147,42 @@ def main():
             X[i,:n] = torch.from_numpy(x)
         return X, lengths
 
-    mb = args.minibatch_size
-
     train_iterator = torch.utils.data.DataLoader(X_train, batch_size=mb, shuffle=True
                                                 , collate_fn=collate)
     test_iterator = torch.utils.data.DataLoader(X_test, batch_size=mb
                                                , collate_fn=collate)
 
-    ## fit the model!
 
+    ## Train the model
     print('# training model', file=sys.stderr)
-
-    output = sys.stdout
-    if args.output is not None:
-        output = open(args.output, 'w')
-
-    num_epochs = args.num_epochs
-    clip = args.clip
-
-    save_prefix = args.save_prefix
     digits = int(np.floor(np.log10(num_epochs))) + 1
-
     print('epoch\tsplit\tlog_p\tperplexity\taccuracy', file=output)
     output.flush()
 
     for epoch in range(num_epochs):
         # train epoch
         model.train()
-        it = 0
-        n = 0
-        accuracy = 0
+        iter = 0
+        n  = 0
+        accuracy   = 0
         loss_accum = 0
         for X,lengths in train_iterator:
             if use_cuda:
                 X = X.cuda()
-            X = Variable(X)
-            logp = model(X)
+            X     = Variable(X)
 
-            mask = (X != mask_idx)
+            # forward pass
+            logp  = model(X)
 
-            index = X*mask.long()
-            loss = -logp.gather(2, index.unsqueeze(2)).squeeze(2)
-            loss = torch.mean(loss.masked_select(mask))
+            mask  = (X != mask_idx)
+            index = X * mask.long()
+            loss  = -logp.gather(2, index.unsqueeze(2)).squeeze(2)
+            loss  = torch.mean(loss.masked_select(mask))
 
             loss.backward()
 
             # clip the gradient
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
-
             solver.step()
             solver.zero_grad()
 
@@ -181,12 +197,12 @@ def main():
             delta = correct.item() - b*accuracy
             accuracy += delta/n
 
-            b = X.size(0)
-            it += b
-            if (it - b)//100 < it//100:
+            batch = X.size(0)
+            iter += batch
+            if (iter - batch)//100 < iter//100:
                 print('# [{}/{}] training {:.1%} loss={:.5f}, acc={:.5f}'.format(epoch+1
                                                                 , num_epochs
-                                                                , it/len(X_train)
+                                                                , iter/len(X_train)
                                                                 , loss_accum
                                                                 , accuracy
                                                                 )
